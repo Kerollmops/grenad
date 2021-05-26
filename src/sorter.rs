@@ -140,6 +140,12 @@ impl<MF> Sorter<MF> {
     pub fn new(merge: MF) -> Sorter<MF> {
         SorterBuilder::new(merge).build()
     }
+
+    fn memory_used(&self) -> usize {
+        let chunks_bytes = self.chunks.capacity() * size_of::<File>();
+        let entries_bytes = self.entries.capacity() * size_of::<Entry>();
+        self.entry_bytes + chunks_bytes + entries_bytes
+    }
 }
 
 impl<MF, U> Sorter<MF>
@@ -152,17 +158,20 @@ where MF: for<'a> Fn(&[u8], &[Cow<'a, [u8]>]) -> Result<Vec<u8>, U>
         let key = key.as_ref();
         let val = val.as_ref();
 
-        let ent = Entry::new(key, val);
-        self.entry_bytes += ent.data.len();
-        self.entries.push(ent);
-
-        let entries_vec_size = self.entries.len() * size_of::<Entry>();
-        if self.entry_bytes + entries_vec_size >= self.max_memory {
+        // If pushing this new entry makes the store consume too much memory,
+        // we must first dump current entries to disk.
+        let one_more_entry = key.len() + val.len() + size_of::<Entry>();
+        if self.memory_used() + one_more_entry >= self.max_memory {
             self.write_chunk()?;
-            if self.chunks.len() > self.max_nb_chunks {
+            if self.chunks.len() >= self.max_nb_chunks {
                 self.merge_chunks()?;
             }
         }
+
+        let ent = Entry::new(key, val);
+        self.entry_bytes += ent.data.capacity();
+        self.entries.reserve_exact(1);
+        self.entries.push(ent);
 
         Ok(())
     }
@@ -219,6 +228,10 @@ where MF: for<'a> Fn(&[u8], &[Cow<'a, [u8]>]) -> Result<Vec<u8>, U>
         self.chunks.push(file);
         self.entry_bytes = 0;
 
+        if self.entries.capacity() * size_of::<Entry>() > self.max_memory {
+            self.entries = Vec::new();
+        }
+
         debug!("writing a chunk took {:.02?}", before_write.elapsed());
 
         Ok(())
@@ -272,6 +285,7 @@ where MF: for<'a> Fn(&[u8], &[Cow<'a, [u8]>]) -> Result<Vec<u8>, U>
     pub fn into_iter(mut self) -> Result<MergerIter<FileFuse, MF>, Error<U>> {
         // Flush the pending unordered entries.
         self.write_chunk()?;
+        self.entries = Vec::new();
 
         let file_fuse_builder = self.file_fuse_builder;
         let sources: Result<Vec<_>, Error<U>> = self.chunks.into_iter().map(|mut file| {
@@ -282,7 +296,6 @@ where MF: for<'a> Fn(&[u8], &[Cow<'a, [u8]>]) -> Result<Vec<u8>, U>
 
         let mut builder = Merger::builder(self.merge);
         builder.extend(sources?);
-
         builder.build().into_merge_iter().map_err(Error::convert_merge_error)
     }
 }
@@ -321,5 +334,39 @@ mod tests {
                 _ => panic!(),
             }
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn allocation() {
+        use std::alloc;
+        use cap::Cap;
+
+        // We add 1MB to the MIN_SORTED_MEMORY because the Rust runtime allocates memory,
+        // it is maybe due to the args that are parsed and allocated Strings.
+        #[global_allocator]
+        static ALLOCATOR: Cap<alloc::System> = Cap::new(alloc::System, MIN_SORTER_MEMORY + 1024 * 1024);
+
+        fn merge(_key: &[u8], _vals: &[Cow<[u8]>]) -> Result<Vec<u8>, Infallible> {
+            panic!("invalid merge");
+        }
+
+        let mut val_buffer = [0u8; 1024];
+        let mut sorter = SorterBuilder::new(merge)
+            .max_memory(MIN_SORTER_MEMORY)
+            .max_nb_chunks(1)
+            .build();
+
+        for i in 0..200_000u32 {
+            let key = i.to_be_bytes();
+            val_buffer.chunks_mut(key.len()).for_each(|buf| buf.copy_from_slice(&key[..]));
+            sorter.insert(key, &val_buffer).unwrap();
+        }
+
+        println!("finish!!!");
+
+        let file = tempfile::tempfile().unwrap();
+        let mut writer = WriterBuilder::new().build(file).unwrap();
+        sorter.write_into(&mut writer).unwrap();
     }
 }
