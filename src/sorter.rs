@@ -15,9 +15,9 @@ const DEFAULT_NB_CHUNKS: usize = 25;
 const MIN_NB_CHUNKS: usize = 1;
 
 use crate::file_fuse::DEFAULT_SHRINK_SIZE;
-use crate::{FileFuse, FileFuseBuilder, Reader, Error};
-use crate::{Merger, MergerIter};
-use crate::{Writer, WriterBuilder, CompressionType};
+use crate::{CompressionType, Writer, WriterBuilder};
+use crate::{Error, FileFuse, FileFuseBuilder, Reader};
+use crate::{Merger, MergerStream, SliceAtLeast};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SorterBuilder<MF> {
@@ -143,11 +143,13 @@ impl<MF> Sorter<MF> {
 }
 
 impl<MF, U> Sorter<MF>
-where MF: for<'a> Fn(&[u8], &[Cow<'a, [u8]>]) -> Result<Vec<u8>, U>
+where
+    MF: for<'a> Fn(&[u8], &SliceAtLeast<Cow<'a, [u8]>, 2>) -> Result<Vec<u8>, U>,
 {
     pub fn insert<K, V>(&mut self, key: K, val: V) -> Result<(), Error<U>>
-    where K: AsRef<[u8]>,
-          V: AsRef<[u8]>,
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
     {
         let key = key.as_ref();
         let val = val.as_ref();
@@ -177,7 +179,7 @@ where MF: for<'a> Fn(&[u8], &[Cow<'a, [u8]>]) -> Result<Vec<u8>, U>
             .compression_level(self.chunk_compression_level)
             .build(file)?;
 
-        self.entries.sort_unstable_by(|a, b| a.key().cmp(&b.key()));
+        self.entries.sort_unstable_by(|a, b| a.key().cmp(b.key()));
 
         let mut current = None;
         for entry in self.entries.drain(..) {
@@ -186,31 +188,31 @@ where MF: for<'a> Fn(&[u8], &[Cow<'a, [u8]>]) -> Result<Vec<u8>, U>
                     let key = entry.key().to_vec();
                     let val = Cow::Owned(entry.val().to_vec());
                     current = Some((key, vec![val]));
-                },
+                }
                 Some((key, vals)) => {
-                    if key == &entry.key() {
-                        vals.push(Cow::Owned(entry.val().to_vec()));
-                    } else {
+                    if key != entry.key() {
                         let merged_val: Vec<u8> = if vals.len() == 1 {
                             vals.pop().map(Cow::into_owned).unwrap()
                         } else {
-                            (self.merge)(&key, &vals).map_err(Error::Merge)?
+                            let vals = SliceAtLeast::new(vals).unwrap();
+                            (self.merge)(key, vals).map_err(Error::Merge)?
                         };
                         writer.insert(&key, &merged_val)?;
                         key.clear();
                         vals.clear();
                         key.extend_from_slice(entry.key());
-                        vals.push(Cow::Owned(entry.val().to_vec()));
                     }
+                    vals.push(Cow::Owned(entry.val().to_vec()));
                 }
             }
         }
 
         if let Some((key, mut vals)) = current.take() {
             let merged_val = if vals.len() == 1 {
-                vals.pop().unwrap().into_owned()
+                vals.pop().map(Cow::into_owned).unwrap()
             } else {
-                (self.merge)(&key, &vals).map_err(Error::Merge)?
+                let vals = SliceAtLeast::new(&vals).unwrap();
+                (self.merge)(&key, vals).map_err(Error::Merge)?
             };
             writer.insert(&key, &merged_val)?;
         }
@@ -237,18 +239,22 @@ where MF: for<'a> Fn(&[u8], &[Cow<'a, [u8]>]) -> Result<Vec<u8>, U>
 
         // Drain the chunks to mmap them and store them into a vector.
         let file_fuse_builder = self.file_fuse_builder;
-        let sources: Result<Vec<_>, Error<U>> = self.chunks.drain(..).map(|mut file| {
-            file.seek(SeekFrom::Start(0))?;
-            let file = file_fuse_builder.build(file);
-            Reader::new(file).map_err(Error::convert_merge_error)
-        }).collect();
+        let sources: Result<Vec<_>, Error<U>> = self
+            .chunks
+            .drain(..)
+            .map(|mut file| {
+                file.seek(SeekFrom::Start(0))?;
+                let file = file_fuse_builder.build(file);
+                Reader::new(file).map_err(Error::convert_merge_error)
+            })
+            .collect();
 
         // Create a merger to merge all those chunks.
         let mut builder = Merger::builder(&self.merge);
         builder.extend(sources?);
         let merger = builder.build();
 
-        let mut iter = merger.into_merge_iter().map_err(Error::convert_merge_error)?;
+        let mut iter = merger.into_merge_stream().map_err(Error::convert_merge_error)?;
         while let Some((key, val)) = iter.next()? {
             writer.insert(key, val)?;
         }
@@ -262,28 +268,32 @@ where MF: for<'a> Fn(&[u8], &[Cow<'a, [u8]>]) -> Result<Vec<u8>, U>
     }
 
     pub fn write_into<W: io::Write>(self, writer: &mut Writer<W>) -> Result<(), Error<U>> {
-        let mut iter = self.into_iter()?;
+        let mut iter = self.into_stream()?;
         while let Some((key, val)) = iter.next()? {
             writer.insert(key, val)?;
         }
         Ok(())
     }
 
-    pub fn into_iter(mut self) -> Result<MergerIter<FileFuse, MF>, Error<U>> {
+    pub fn into_stream(mut self) -> Result<MergerStream<FileFuse, MF>, Error<U>> {
         // Flush the pending unordered entries.
         self.write_chunk()?;
 
         let file_fuse_builder = self.file_fuse_builder;
-        let sources: Result<Vec<_>, Error<U>> = self.chunks.into_iter().map(|mut file| {
-            file.seek(SeekFrom::Start(0))?;
-            let file = file_fuse_builder.build(file);
-            Reader::new(file).map_err(Error::convert_merge_error)
-        }).collect();
+        let sources: Result<Vec<_>, Error<U>> = self
+            .chunks
+            .into_iter()
+            .map(|mut file| {
+                file.seek(SeekFrom::Start(0))?;
+                let file = file_fuse_builder.build(file);
+                Reader::new(file).map_err(Error::convert_merge_error)
+            })
+            .collect();
 
         let mut builder = Merger::builder(self.merge);
         builder.extend(sources?);
 
-        builder.build().into_merge_iter().map_err(Error::convert_merge_error)
+        builder.build().into_merge_stream().map_err(Error::convert_merge_error)
     }
 }
 
@@ -294,14 +304,12 @@ mod tests {
 
     #[test]
     fn simple() {
-        fn merge(_key: &[u8], vals: &[Cow<[u8]>]) -> Result<Vec<u8>, Infallible> {
-            assert_ne!(vals.len(), 1);
+        fn merge(_key: &[u8], vals: &SliceAtLeast<Cow<[u8]>, 2>) -> Result<Vec<u8>, Infallible> {
             Ok(vals.iter().map(AsRef::as_ref).flatten().cloned().collect())
         }
 
-        let mut sorter = SorterBuilder::new(merge)
-            .chunk_compression_type(CompressionType::Snappy)
-            .build();
+        let mut sorter =
+            SorterBuilder::new(merge).chunk_compression_type(CompressionType::Snappy).build();
 
         sorter.insert(b"hello", "kiki").unwrap();
         sorter.insert(b"abstract", "lol").unwrap();

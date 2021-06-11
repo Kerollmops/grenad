@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::io::{self, ErrorKind};
 use std::mem;
 
-use byteorder::{ReadBytesExt, BigEndian};
+use byteorder::{BigEndian, ReadBytesExt};
 
 use crate::compression::{decompress, CompressionType};
 use crate::varint::varint_decode32;
@@ -34,6 +34,7 @@ impl<R: io::Read> Reader<R> {
         self.compression_type
     }
 
+    #[allow(clippy::should_implement_trait, clippy::type_complexity)]
     pub fn next(&mut self) -> Result<Option<(&[u8], &[u8])>, Error> {
         match &mut self.current_block {
             Some(block) => {
@@ -44,15 +45,15 @@ impl<R: io::Read> Reader<R> {
                         let key: &'static _ = unsafe { mem::transmute(key) };
                         let val: &'static _ = unsafe { mem::transmute(val) };
                         Ok(Some((key, val)))
-                    },
+                    }
                     None => {
                         if !block.read_from(&mut self.reader)? {
                             return Ok(None);
                         }
                         block.next()
-                    },
+                    }
                 }
-            },
+            }
             None => Ok(None),
         }
     }
@@ -70,12 +71,12 @@ struct BlockReader {
 }
 
 impl BlockReader {
-    fn new<R: io::Read>(reader: &mut R, _type: CompressionType) -> Result<Option<BlockReader>, Error> {
-        let mut block_reader = BlockReader {
-            compression_type: _type,
-            buffer: Vec::new(),
-            offset: 0,
-        };
+    fn new<R: io::Read>(
+        reader: &mut R,
+        _type: CompressionType,
+    ) -> Result<Option<BlockReader>, Error> {
+        let mut block_reader =
+            BlockReader { compression_type: _type, buffer: Vec::new(), offset: 0 };
 
         if block_reader.read_from(reader)? {
             Ok(Some(block_reader))
@@ -98,14 +99,14 @@ impl BlockReader {
         self.buffer.resize(block_len as usize, 0);
         reader.read_exact(&mut self.buffer)?;
 
-        match decompress(self.compression_type, &self.buffer)? {
-            Cow::Owned(vec) => self.buffer = vec,
-            Cow::Borrowed(_) => (),
-        };
+        if let Cow::Owned(vec) = decompress(self.compression_type, &self.buffer)? {
+            self.buffer = vec;
+        }
 
         Ok(true)
     }
 
+    #[allow(clippy::should_implement_trait, clippy::type_complexity)]
     fn next(&mut self) -> Result<Option<(&[u8], &[u8])>, Error> {
         if self.buffer.len() == self.offset {
             return Ok(None);

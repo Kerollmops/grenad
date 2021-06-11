@@ -1,5 +1,5 @@
-use std::cmp;
 use crate::varint::varint_encode32;
+use std::cmp;
 
 pub const DEFAULT_BLOCK_SIZE: usize = 8192;
 pub const MIN_BLOCK_SIZE: usize = 1024;
@@ -13,11 +13,7 @@ pub struct BlockBuilder {
 impl BlockBuilder {
     pub fn new(block_size: usize) -> BlockBuilder {
         let block_size = cmp::max(MIN_BLOCK_SIZE, block_size);
-        BlockBuilder {
-            block_size,
-            buffer: Vec::with_capacity(block_size),
-            last_key: None,
-        }
+        BlockBuilder { block_size, buffer: Vec::with_capacity(block_size), last_key: None }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -35,10 +31,10 @@ impl BlockBuilder {
         // and save the current key to become the last key.
         match &mut self.last_key {
             Some(last_key) => {
-                assert!(key > &last_key);
+                assert!(key > last_key);
                 last_key.clear();
                 last_key.extend_from_slice(key);
-            },
+            }
             None => self.last_key = Some(key.to_vec()),
         }
 
